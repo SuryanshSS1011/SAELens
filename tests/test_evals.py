@@ -177,6 +177,61 @@ def test_run_evals_base_sae(
     assert len(eval_metrics) > 0
 
 
+def test_explained_variance_is_relative_to_the_mean(
+    base_sae: SAE[Any],
+    activation_store: ActivationsStore,
+    model: HookedTransformer,
+):
+    # Regression test for https://github.com/jbloomAus/SAELens/issues/659. The "new"
+    # explained_variance computed total variance relative to zero (E[x²]) rather than relative to
+    # the mean (Σ_d E[x_d²] - E[x_d]²), which inflated the metric (e.g. 0.98 vs a true ~0.78).
+    #
+    # Capture the per-batch SAE inputs/outputs the metric actually sees, then compare the reported
+    # explained_variance against the definition computed directly over the concatenated activations:
+    # 1 - Σ‖x - x_hat‖² / Σ‖x - mean(x)‖², where the mean is taken over all rows.
+    captured_inputs: list[torch.Tensor] = []
+    captured_outputs: list[torch.Tensor] = []
+    original_decode = base_sae.decode
+
+    def decode_and_capture(feature_acts: torch.Tensor) -> torch.Tensor:
+        out = original_decode(feature_acts)
+        captured_outputs.append(out.reshape(-1, out.shape[-1]).detach().cpu())
+        return out
+
+    original_encode = base_sae.encode
+
+    def encode_and_capture(acts: torch.Tensor) -> torch.Tensor:
+        captured_inputs.append(acts.reshape(-1, acts.shape[-1]).detach().cpu())
+        return original_encode(acts)
+
+    with (
+        patch.object(base_sae, "encode", side_effect=encode_and_capture),
+        patch.object(base_sae, "decode", side_effect=decode_and_capture),
+    ):
+        metric_dict, _ = get_sparsity_and_variance_metrics(
+            sae=base_sae,
+            model=model,
+            activation_store=activation_store,
+            activation_scaler=ActivationScaler(),
+            n_batches=5,
+            compute_l2_norms=False,
+            compute_sparsity_metrics=False,
+            compute_variance_metrics=True,
+            compute_featurewise_density_statistics=False,
+            eval_batch_size_prompts=4,
+            model_kwargs={},
+        )
+
+    x = torch.cat(captured_inputs)
+    x_hat = torch.cat(captured_outputs)
+    resid_ss = (x - x_hat).pow(2).sum(dim=-1).sum()
+    total_var = (x - x.mean(dim=0)).pow(2).sum(dim=-1).sum()
+    expected = (1 - resid_ss / total_var).item()
+
+    assert metric_dict["explained_variance"] == pytest.approx(expected, rel=1e-3)
+    assert metric_dict["explained_variance"] <= 1.0 + 1e-4
+
+
 @pytest.mark.parametrize("use_sparse_activations", [True, False])
 def test_run_evals_sparse_topk_sae(
     model: HookedTransformer,

@@ -553,7 +553,7 @@ def get_sparsity_and_variance_metrics(
                 (flattened_sae_input).pow(2).sum(dim=-1).mean(dim=0)  # scalar
             )
             mean_act_per_dimension.append(
-                (flattened_sae_input).pow(2).mean(dim=0)  # [d_model]
+                (flattened_sae_input).mean(dim=0)  # E[x_d] per dimension, [d_model]
             )
             mean_sum_of_resid_squared.append(
                 resid_sum_of_squares.mean(dim=0)  # scalar
@@ -587,9 +587,13 @@ def get_sparsity_and_variance_metrics(
 
     # calculate explained variance
     if compute_variance_metrics:
+        # total_variance = Σ_d Var(x_d) = Σ_d (E[x_d²] - E[x_d]²). mean_sum_of_squares is the
+        # scalar E[Σ_d x_d²]; mean_act_per_dimension holds per-batch E[x_d] vectors of shape
+        # [d_model], so stack+mean gives the overall E[x_d] per dimension, and squaring then
+        # summing over dimensions gives the scalar Σ_d E[x_d]².
         mean_sum_of_squares = torch.stack(mean_sum_of_squares).mean(dim=0)
-        mean_act_per_dimension = torch.cat(mean_act_per_dimension).mean(dim=0)
-        total_variance = mean_sum_of_squares - mean_act_per_dimension**2
+        mean_act_per_dimension = torch.stack(mean_act_per_dimension).mean(dim=0)
+        total_variance = mean_sum_of_squares - mean_act_per_dimension.pow(2).sum()
         residual_variance = torch.stack(mean_sum_of_resid_squared).mean(dim=0)
         metrics["explained_variance"] = (1 - residual_variance / total_variance).item()
 
